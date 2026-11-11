@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test:redact": "esbuild src/ai/redact.ts --bundle --format=esm --platform=node --outfile=.tmp/redact.mjs --log-level=error && node --test scripts/redact.test.mjs"
   },
   "dependencies": {
     "firebase": "^12.5.0"

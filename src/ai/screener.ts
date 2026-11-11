@@ -7,21 +7,22 @@ import {
   InferenceMode,
   type GenerativeModel,
 } from "firebase/ai";
-import { redact, looksClean } from "./redact.js";
-import type { AgentAction, Screening, Sensitivity } from "../core/types.js";
+import { redact, looksClean, hasCredentials } from "./redact.js";
+import type { ActionKind, AgentAction, Screening, Sensitivity } from "../core/types.js";
 
 /**
  * The hybrid screener.
  *
  * Every action is screened on-device first. The on-device model sees the real
  * payload — emails, SQL, shell commands, customer records — and that content
- * never leaves the machine. Only when the local model reports low confidence
- * does AgentGuard consult the cloud, and then it sends a redacted summary, not
- * the payload.
+ * never leaves the machine. The cloud is consulted for a second opinion only in
+ * a few defined cases (see `escalationReason`), and then it receives a redacted
+ * summary, not the payload. Redaction is pattern-based, so the cloud still sees
+ * a redacted version of the action; anything that carried credential material is
+ * never escalated at all.
  *
- * This is why hybrid inference is the right architecture here rather than a box
- * to tick. Routine screening has to be free, instant and private, or nobody
- * will run it on every action. Hard cases are rare and worth a round trip.
+ * Routine screening has to be free, instant and private, or nobody will run it
+ * on every action. Hard cases are rare and worth a round trip.
  *
  * The screener is advisory in both modes. It never decides allow or deny —
  * that stays in the deterministic policy engine. A model that can be argued
@@ -49,14 +50,31 @@ const SEVERITY: Sensitivity[] = [
 ];
 
 /**
- * Measured on this machine (Chrome device class "Very Low"): a real screening
- * prompt takes ~30s on-device. 20s timed out every call. A timed-out call is not
- * cancelled and keeps the model busy, so it is not retried.
+ * Measured on a Chrome "Very Low" performance class device: a real screening
+ * prompt takes 15-30s on-device, and 20s timed out every call. A timed-out call
+ * is not cancelled and keeps the model busy, so it is not retried.
  */
 const MODEL_TIMEOUT_MS = 90_000;
 
 /** Below this, the on-device judgement is not trusted on its own. */
 const ESCALATE_BELOW_CONFIDENCE = 0.7;
+
+/**
+ * Action kinds whose nature is known to the guard without asking any model.
+ * If the on-device label contradicts what the action type implies, the small
+ * model got something wrong that we can see, and a second opinion is warranted.
+ *
+ * This is a consistency check against deterministic data, not a second guess at
+ * the model's certainty. It exists because the model's self-reported confidence
+ * turned out to be coarse (only 0.7, 0.8 and 0.9 were ever observed) while its
+ * labels were visibly wrong on some actions, such as calling `rm -rf` public.
+ */
+const EXPECTED_SENSITIVITY: Partial<Record<ActionKind, Sensitivity>> = {
+  delete_file: "destructive",
+  modify_database: "destructive",
+  post_public: "public_facing",
+  make_payment: "financial",
+};
 
 const INSTRUCTION = `You screen actions that an AI agent wants to perform on a user's behalf.
 
@@ -73,24 +91,33 @@ ambiguous or you lack context.
 Never recommend approving or denying. Describe what the action is and what
 stands out about it.`;
 
+export interface ScreenerOptions {
+  recaptchaSiteKey?: string;
+  debugAppCheck?: boolean;
+  /**
+   * Testing only. Treats every on-device result as needing a second opinion so
+   * the cloud path can be exercised on demand. The UI must say so whenever it
+   * is on; a forced run must never be mistaken for a natural one.
+   */
+  forceEscalate?: boolean;
+}
+
 export class Screener {
   private model: GenerativeModel | null = null;
   private app: FirebaseApp | null = null;
-  private deviceReady = false;
+  private readonly forceEscalate: boolean;
 
   /** Did Firebase config load? Without it, screening runs on heuristics. */
   readonly configured: boolean;
 
-  constructor(
-    firebaseConfig: Record<string, string> | null,
-    opts: { recaptchaSiteKey?: string; debugAppCheck?: boolean } = {},
-  ) {
+  constructor(firebaseConfig: Record<string, string> | null, opts: ScreenerOptions = {}) {
     this.configured = Boolean(firebaseConfig?.apiKey);
+    this.forceEscalate = Boolean(opts.forceEscalate);
     if (!firebaseConfig?.apiKey) return;
 
     this.app = initializeApp(firebaseConfig);
 
-    // Firebase AI Logic enforces App Check. On localhost there is no real
+    // Firebase AI Logic can enforce App Check. On localhost there is no real
     // attestation, so a debug token is used instead — set before
     // initializeAppCheck or it is ignored. The token prints to the console on
     // first run and has to be registered in the Firebase console once.
@@ -132,17 +159,12 @@ export class Screener {
       await this.model.initializeDeviceModel((v: number) =>
         onProgress?.(Math.round(v * 10000) / 100),
       );
-      this.deviceReady = true;
       return true;
     } catch {
-      // Cloud-only still works; the privacy story weakens but the guard holds.
-      this.deviceReady = false;
+      // No device model. Screening will use heuristics; the cloud is NOT used
+      // for pass one, so the unredacted payload still never leaves the machine.
       return false;
     }
-  }
-
-  get onDeviceReady(): boolean {
-    return this.deviceReady;
   }
 
   /** Serialises screening. Concurrent calls to the on-device model collide. */
@@ -161,26 +183,29 @@ export class Screener {
     const local = await this.ask(describe(action, { redacted: false }));
     if (!local) return heuristic(action, this.lastError);
 
-    // TEMPORARY: confidence distribution measurement. Remove after review.
-    console.log(
-      `[AgentGuard:confidence] ${action.actionId} ${action.kind} "${action.summary}" ` +
-        `confidence=${local.confidence} risk=${local.riskScore} sens=${local.sensitivity}`,
-    );
-
     // Pass one runs ONLY_ON_DEVICE, so a result here is always from the device.
-    // Labelling it by a `deviceReady` flag, as an earlier version did, could
-    // report "cloud" for a judgement that never touched the cloud — and would
-    // have hidden the fallback bug above.
-    if (local.confidence >= ESCALATE_BELOW_CONFIDENCE) {
-      return { ...local, ranOn: "device", escalated: false };
-    }
+    const reason = this.escalationReason(action, local);
+    if (!reason) return { ...local, ranOn: "device", escalated: false };
 
-    // --- Pass two: the local model was unsure. Redact, then escalate. ---
+    // --- Pass two: a second opinion is warranted. Redact, then escalate. ---
     const { text: safeSummary, removed } = redact(describe(action, { redacted: true }));
 
+    if (hasCredentials(removed)) {
+      // Credential material never leaves the device, redacted or not. The
+      // policy engine refuses these on its own; the cloud adds nothing.
+      return {
+        ...local,
+        ranOn: "device",
+        escalated: false,
+        explanation:
+          local.explanation +
+          " (Not escalated: this action contains credential material, which stays on the device.)",
+      };
+    }
+
     if (!looksClean(safeSummary)) {
-      // Redaction did not come out clean. Keep the uncertain local answer
-      // rather than risk sending an identifier off the device.
+      // Redaction did not come out clean. Keep the local answer rather than
+      // risk sending an identifier off the device.
       return {
         ...local,
         ranOn: "device",
@@ -204,6 +229,7 @@ export class Screener {
       ...cloud,
       ranOn: "cloud",
       escalated: true,
+      escalationReason: reason,
       redactedSummary: safeSummary,
       explanation:
         cloud.explanation +
@@ -211,7 +237,29 @@ export class Screener {
     };
   }
 
-  /** Why the last screening fell back, if it did. Surfaced for debugging. */
+  /**
+   * Why, if at all, the cloud should be consulted. Returns plain words for the
+   * operator to read, or null for "the local answer stands".
+   */
+  private escalationReason(
+    action: AgentAction,
+    local: Omit<Screening, "ranOn" | "escalated">,
+  ): string | null {
+    if (this.forceEscalate) return "escalation forced for testing";
+
+    if (local.confidence < ESCALATE_BELOW_CONFIDENCE) {
+      return `the on-device model was unsure (confidence ${Math.round(local.confidence * 100)}%)`;
+    }
+
+    const expected = EXPECTED_SENSITIVITY[action.kind];
+    if (expected && local.sensitivity !== expected) {
+      return `the on-device label (${local.sensitivity}) did not match the action type (${action.kind.replace(/_/g, " ")})`;
+    }
+
+    return null;
+  }
+
+  /** Why the last on-device screening fell back, if it did. Surfaced for debugging. */
   lastError: string | null = null;
 
   private async ask(
@@ -226,42 +274,42 @@ export class Screener {
       model = getGenerativeModel(ai, { mode: InferenceMode.ONLY_IN_CLOUD });
     }
 
+    let lastError: string | null = null;
+
     // Two attempts. The on-device model intermittently rejects a request when
     // several are issued close together, and a single retry clears most of it.
     // Without the retry the guard silently drops to heuristics, which looks
     // like the model is unavailable when it is merely busy.
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const t0 = performance.now(); // TEMPORARY timing instrumentation
       try {
         const result = await withTimeout(
           model.generateContent(`${INSTRUCTION}\n\n${body}`),
           MODEL_TIMEOUT_MS,
           "model call timed out",
         );
-        console.log(
-          `[AgentGuard:timing] ${opts.forceCloud ? "cloud" : "device"} attempt ${attempt} ok in ${Math.round(performance.now() - t0)}ms`,
-        );
         const parsed = parse(result.response.text());
         if (parsed) {
-          this.lastError = null;
+          if (!opts.forceCloud) this.lastError = null;
           return parsed;
         }
-        this.lastError = "model returned unparseable output";
+        lastError = "model returned unparseable output";
       } catch (err) {
-        this.lastError = err instanceof Error ? err.message : String(err);
-        console.log(
-          `[AgentGuard:timing] ${opts.forceCloud ? "cloud" : "device"} attempt ${attempt} FAILED after ${Math.round(performance.now() - t0)}ms: ${this.lastError}`,
-        );
+        lastError = err instanceof Error ? err.message : String(err);
       }
 
       // Retrying after a timeout would queue behind the call still running.
-      if (this.lastError === "model call timed out") break;
+      if (lastError === "model call timed out") break;
       if (attempt === 1) await sleep(400);
     }
 
     // Swallowing this silently is what made the earlier fallbacks impossible to
     // diagnose. The guard still degrades safely; it just says why now.
-    console.warn("[AgentGuard] screening fell back to heuristics:", this.lastError);
+    if (opts.forceCloud) {
+      console.warn("[AgentGuard] cloud escalation failed; keeping the on-device result:", lastError);
+    } else {
+      this.lastError = lastError;
+      console.warn("[AgentGuard] screening fell back to heuristics:", lastError);
+    }
     return null;
   }
 }
@@ -291,13 +339,14 @@ function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> 
 }
 
 function describe(a: AgentAction, opts: { redacted: boolean }): string {
-  // The redacted variant deliberately omits the exact target and amount; those
-  // are reconstructed as shape by the redactor.
+  // The redacted variant leaves out the exact target, which is usually an
+  // address or a host. Everything else still goes through `redact()` before it
+  // is sent anywhere; the amount, for one, becomes a bucket there.
   return [
     `Action: ${a.kind}`,
     `Agent: ${a.agentId}`,
     `Summary: ${a.summary}`,
-    `Target: ${a.target}`,
+    opts.redacted ? null : `Target: ${a.target}`,
     `Records or recipients affected: ${a.scope}`,
     a.amountMinor > 0 ? `Amount: ${(a.amountMinor / 100).toFixed(2)} ${a.currency}` : null,
     `Content:\n${a.payload}`,
@@ -345,7 +394,7 @@ function heuristic(a: AgentAction, why: string | null = null): Screening {
   const payload = `${a.summary} ${a.payload}`.toLowerCase();
 
   let sensitivity: Sensitivity = "routine";
-  if (/sk-|api[_ ]key|password|token|secret/.test(payload)) sensitivity = "credentials";
+  if (/\bsk-|api[_ ]key|password|token|secret/.test(payload)) sensitivity = "credentials";
   else if (a.kind === "delete_file" || a.kind === "modify_database") sensitivity = "destructive";
   else if (a.kind === "post_public") sensitivity = "public_facing";
   else if (a.amountMinor > 0 || a.kind === "make_payment") sensitivity = "financial";

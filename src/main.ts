@@ -12,7 +12,12 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 } as Record<string, string>;
 
+// ?forceEscalate=1 exercises the cloud path on demand. It is labelled in the UI
+// whenever it is on, so a forced run is never mistaken for a natural one.
+const forceEscalate = new URLSearchParams(location.search).get("forceEscalate") === "1";
+
 const screener = new Screener(firebaseConfig.apiKey ? firebaseConfig : null, {
+  forceEscalate,
   recaptchaSiteKey: import.meta.env.VITE_RECAPTCHA_SITE_KEY,
   // Debug attestation only in `npm run dev`. A production build never ships it.
   debugAppCheck: import.meta.env.DEV,
@@ -125,6 +130,11 @@ function renderPending(pending: PendingApproval[]): void {
           ${esc(s.explanation)}
         </div>
         ${
+          s.escalationReason
+            ? `<div class="assess"><div class="lbl">Why the cloud was asked</div>${esc(s.escalationReason)}</div>`
+            : ""
+        }
+        ${
           s.redactedSummary
             ? `<div class="redacted">
                  <div class="lbl">This, and only this, left your device</div>
@@ -206,7 +216,6 @@ async function refresh(): Promise<void> {
   $("lim-max").textContent = money(policy.limits.maxPaymentMinor);
   $("lim-appr").textContent = money(policy.limits.paymentApprovalMinor);
   $("lim-bulk").textContent = String(policy.limits.bulkScopeThreshold);
-  $("lim-risk").textContent = String(policy.limits.riskApprovalThreshold);
 
   renderPending(guard.listPending());
   renderLedger(guard.ledger.all());
@@ -217,7 +226,7 @@ async function refresh(): Promise<void> {
 
   const v = await guard.ledger.verify();
   $("chip-ledger").textContent = v.ok
-    ? `ledger intact · ${v.length} entries`
+    ? `ledger intact · ${v.length} entries${v.persisted ? "" : " · not saved"}`
     : `LEDGER BROKEN at #${v.brokenAtSeq}`;
   $("chip-ledger").className = "chip " + (v.ok ? "ok" : "bad");
 }
@@ -241,6 +250,13 @@ if (!screener.configured) {
   setDeviceChip("on-device: not started");
 }
 
+if (forceEscalate) {
+  const el = $("setup");
+  el.style.display = "block";
+  el.innerHTML =
+    "<b>Escalation forced for testing.</b> Every on-device result is sent for a cloud second opinion (redacted). This is not how AgentGuard behaves normally.";
+}
+
 $("btn-enable").addEventListener("click", async () => {
   const btn = $("btn-enable") as HTMLButtonElement;
   btn.disabled = true;
@@ -250,7 +266,7 @@ $("btn-enable").addEventListener("click", async () => {
     setDeviceChip("on-device: ready", true);
     btn.textContent = "On-device screening active";
   } else {
-    setDeviceChip("on-device unavailable — cloud only");
+    setDeviceChip("on-device unavailable — heuristics only");
     btn.disabled = false;
     btn.textContent = "Retry on-device screening";
   }

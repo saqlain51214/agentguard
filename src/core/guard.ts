@@ -1,6 +1,7 @@
 import { Ledger } from "./ledger.js";
 import { DEFAULT_POLICY, evaluate, type Policy } from "./policy.js";
 import type { Screener } from "../ai/screener.js";
+import { redact } from "../ai/redact.js";
 import type { AgentAction, PendingApproval, Verdict } from "./types.js";
 
 /**
@@ -11,6 +12,14 @@ import type { AgentAction, PendingApproval, Verdict } from "./types.js";
  * audit trail complete by construction rather than by everyone remembering to
  * log things.
  */
+/**
+ * What the ledger is allowed to remember about the other end of an action.
+ * Targets and summaries are often identifiers themselves (an email address, a
+ * customer-facing path), and the ledger persists in storage, so they are
+ * redacted here the same way text bound for the cloud is.
+ */
+const safe = (s: string) => redact(s).text;
+
 export class Guard {
   readonly ledger = new Ledger();
   private policy: Policy = DEFAULT_POLICY;
@@ -49,8 +58,8 @@ export class Guard {
       event: "action_proposed",
       payload: {
         kind: action.kind,
-        summary: action.summary,
-        target: action.target,
+        summary: safe(action.summary),
+        target: safe(action.target),
         scope: action.scope,
         amountMinor: action.amountMinor,
         currency: action.currency,
@@ -69,6 +78,7 @@ export class Guard {
         confidence: screening.confidence,
         ranOn: screening.ranOn,
         escalated: screening.escalated,
+        escalationReason: screening.escalationReason ?? null,
         // The redacted summary is recorded precisely because it is what left
         // the device. The raw payload is never written to the ledger.
         redactedSummary: screening.redactedSummary ?? null,
@@ -78,7 +88,6 @@ export class Guard {
     const { decision, reasons } = evaluate(this.policy, {
       action,
       sensitivity: screening.sensitivity,
-      riskScore: screening.riskScore,
     });
 
     const verdict: Verdict = { decision, reasons, screening };
@@ -146,8 +155,8 @@ export class Guard {
         kind: action.kind,
         amountMinor: action.amountMinor,
         currency: action.currency,
-        target: action.target,
-        outcome,
+        target: safe(action.target),
+        outcome: safe(outcome),
       },
     });
   }

@@ -60,13 +60,15 @@ export interface Screening {
   sensitivity: Sensitivity;
   /** 0-100. */
   riskScore: number;
-  /** 0-1. Below the escalation threshold, the cloud is consulted. */
+  /** 0-1. The model's own certainty. Low values are one reason to escalate. */
   confidence: number;
   explanation: string;
   /** Where the judgement came from. Surfaced in the UI and the ledger. */
   ranOn: "device" | "cloud" | "heuristics";
-  /** True when the on-device pass was uncertain and the cloud was consulted. */
+  /** True when the cloud was consulted for a second opinion. */
   escalated: boolean;
+  /** Why the cloud was consulted, in plain words. Set only when `escalated`. */
+  escalationReason?: string;
   /** What was actually sent to the cloud, if anything. Shown to the user. */
   redactedSummary?: string;
 }

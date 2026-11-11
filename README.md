@@ -24,7 +24,6 @@ So the work is split:
 
 **On-device (Gemini Nano, via Firebase AI Logic `ONLY_ON_DEVICE`)** sees the real
 payload and screens every action. No network, no cost, no data leaving the machine.
-This handles the overwhelming majority of actions.
 
 The mode is `ONLY_ON_DEVICE` on purpose, not `PREFER_ON_DEVICE`. The "prefer" mode
 falls back to the cloud silently when no local model exists, and that first pass
@@ -32,13 +31,32 @@ carries the real, unredacted payload. Here, with no device model, screening drop
 to heuristics and every rule still runs. The cloud is reachable only through the
 redacted escalation path below.
 
-**Cloud (Gemini, `ONLY_IN_CLOUD`)** is consulted only when the on-device model reports
-low confidence in its own judgement — the genuinely ambiguous cases. And it never sees
-the payload: the action is redacted first, and the UI shows you the exact text that
+**Cloud (Gemini, `ONLY_IN_CLOUD`)** is a second opinion, asked for in three cases:
+
+1. the on-device model reports low confidence in its own judgement (below 0.7);
+2. its label contradicts what the action type already tells us. `rm -rf` is a
+   `delete_file`; if the local model calls that "public facing", it got something wrong
+   that we can see, so we ask again;
+3. a developer forces it with `?forceEscalate=1`, which the UI labels while it is on.
+
+Escalation is deliberately rare. In one run of the nine demo scenarios on Gemini Nano,
+the model's confidence was never below 0.7, so case 1 did not fire at all, and its
+labels were wrong on the two destructive actions, which is what case 2 catches. Labels
+and scores vary from run to run. I report that rather than tune a threshold until the
+demo escalates more.
+
+What the cloud receives is a **redacted** version of the action, not nothing. Redaction
+is pattern-based (`src/ai/redact.ts`). It removes emails, phone numbers, card numbers,
+IBANs, IPs, API keys and tokens, credentials written as `password: ...`, URL paths,
+labelled names and addresses, internal hostnames and long opaque strings, and it turns
+exact amounts into buckets. It does **not** understand free text: an unlabelled name or
+a sentence describing a secret would get through. The UI shows you the exact text that
 left your device, so the claim can be inspected rather than believed.
 
-If redaction cannot produce a clean summary, the escalation is **skipped** and the
-uncertain local answer stands. Privacy wins the tie.
+Two cases never reach the cloud. If the action contains credential material, it stays
+on the device (the policy engine refuses it on its own anyway). And if the redacted
+text fails an independent re-check, the escalation is **skipped** and the local answer
+stands. Privacy wins the tie.
 
 This is the whole argument for hybrid, and it is not a box being ticked. A cloud-only
 version of AgentGuard would be unusable for the data it exists to protect. An
@@ -50,15 +68,21 @@ on-device-only version would be wrong too often on the hard cases.
 
 The model classifies, scores risk, and writes the explanation you read on the approval
 card. It **never** makes the allow/deny call. That lives in a pure function with no
-network and no model.
+network and no model, and the risk score is not one of its inputs: the same action was
+scored 20, 40 and 25 on different runs, so a threshold on it would flip verdicts at
+random. The score is shown to the human as advice.
 
 This matters because an agent under prompt injection will try to argue its way past
-the guard — and with AgentGuard it is arguing with an `if` statement. A model that can
-be talked into permitting an action is not a control, it is another attack surface.
+the guard. Where a rule covers the action, it is arguing with an `if` statement. A model
+that can be talked into permitting an action is not a control, it is another attack
+surface. Where no rule applies the default is to allow, which is why shell commands and
+outbound requests have a rule of their own that always sends them to a human. The rule
+set is small and a real deployment would need a much more complete one.
 
 It also means the guard keeps working when the model does not. If inference fails or
 the device model is unavailable, screening falls back to heuristics and **every rule
-still runs**. A guard that fails open is not a guard.
+still runs**. Malformed numbers (a missing amount, a NaN record count) are refused
+outright rather than waved through.
 
 ---
 
@@ -117,14 +141,23 @@ On any held action, the card shows which screening path was used — **on device
 
 ## The ledger
 
-Every entry stores the SHA-256 hash of the entry before it. Editing or deleting any
-past record breaks every hash after it, and the header badge reports where the chain
-broke.
+Every entry stores the SHA-256 hash of the entry before it. Editing or deleting a
+record in the middle breaks every hash after it, and the header badge reports where the
+chain broke. The latest entry's hash is also stored separately, so cutting entries off
+the end is caught too.
 
-The audit trail is the product. You do not have to trust the agent, and you do not have
-to trust that nobody edited the log afterwards — you can check. Note that the raw
-payload is never written to the ledger; the redacted summary is, precisely because it
-is the thing that left the device.
+The audit trail is the product, and it is worth saying exactly how far it goes. This
+detects casual and partial tampering. It does **not** stop someone with access to the
+browser's storage from rewriting the whole chain and recomputing every hash, because the
+hashes are unkeyed and everything lives in one place. Anchoring the latest hash somewhere
+the operator cannot write (a server, a signed timestamp) is the real fix, and is not
+built.
+
+The raw payload is never written to the ledger. Targets and summaries are redacted
+before they are recorded, because an address or a path is often an identifier itself.
+The "Clear ledger" button resets the demo and wipes the log; it is not part of how a
+real ledger would behave. Pending approvals live in memory only, so reloading the page
+leaves an `approval_requested` entry with no resolution.
 
 Hashing uses Web Crypto, so appends are async and serialised through a tail promise —
 two concurrent appends cannot read the same previous entry and fork the chain.
@@ -137,7 +170,7 @@ two concurrent appends cannot read the same previous entry and fork the chain.
 src/
   core/guard.ts      the one chokepoint — the only path to execution
   core/policy.ts     deterministic evaluation. no network, no model
-  core/ledger.ts     hash-chained append-only log + verification
+  core/ledger.ts     hash-chained log + verification (see the caveats above)
   core/types.ts      domain types
   ai/screener.ts     hybrid screening: on-device first, redacted cloud escalation
   ai/redact.ts       what runs before anything leaves the device
@@ -154,12 +187,25 @@ trail complete by construction rather than by discipline.
 
 A prototype built for the Firebase #BuildHybridAI hackathon. Before this guarded
 anything real it would need: policy storage and per-agent scoping, authentication, the
-ledger in an append-only store rather than `localStorage`, a real approval channel
-rather than a page someone has to be watching, and a hardened adapter layer for actual
-agent tool calls rather than the demo executor.
+ledger in an append-only store anchored outside the browser rather than `localStorage`,
+a real approval channel rather than a page someone has to be watching, a much more
+complete rule set, and a hardened adapter layer for actual agent tool calls rather than
+the demo executor.
 
 The architecture is the contribution: screen locally, escalate rarely and redacted,
-let rules decide, and write everything down where it can be verified.
+let rules decide, and write everything down where it can be checked. The pieces that
+are solid are the single chokepoint and the deterministic policy. The pieces that are
+honest approximations are the redaction (patterns, not understanding) and the ledger
+(tamper-evident, not tamper-proof).
+
+## Checks
+
+```bash
+npm run check         # tsc
+npm run build
+npm run test:redact   # redaction tests, no extra dependencies
+```
+
 
 ## License
 
