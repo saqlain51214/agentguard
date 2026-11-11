@@ -22,9 +22,15 @@ single agent action. That is a worse privacy posture than having no guard at all
 
 So the work is split:
 
-**On-device (Gemini Nano, via Firebase AI Logic `PREFER_ON_DEVICE`)** sees the real
+**On-device (Gemini Nano, via Firebase AI Logic `ONLY_ON_DEVICE`)** sees the real
 payload and screens every action. No network, no cost, no data leaving the machine.
 This handles the overwhelming majority of actions.
+
+The mode is `ONLY_ON_DEVICE` on purpose, not `PREFER_ON_DEVICE`. The "prefer" mode
+falls back to the cloud silently when no local model exists, and that first pass
+carries the real, unredacted payload. Here, with no device model, screening drops
+to heuristics and every rule still runs. The cloud is reachable only through the
+redacted escalation path below.
 
 **Cloud (Gemini, `ONLY_IN_CLOUD`)** is consulted only when the on-device model reports
 low confidence in its own judgement — the genuinely ambiguous cases. And it never sees
@@ -59,6 +65,10 @@ still runs**. A guard that fails open is not a guard.
 ## Run it
 
 Needs Node 18+ and Chrome Desktop 139+.
+
+On-device speed depends on your hardware. On a machine Chrome classes as "Very Low"
+performance, one screening call takes about 30 seconds, so running all nine scenarios
+takes several minutes. I have not yet measured a machine with a capable GPU.
 
 **1. Enable the on-device model in Chrome**
 
